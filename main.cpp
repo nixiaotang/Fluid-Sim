@@ -3,6 +3,7 @@
 #include <iostream>
 
 #include "shader.h"
+#include "util.h"
 
 void framebuffer_size_callback(GLFWwindow* window, int width, int height);
 void processInput(GLFWwindow *window);
@@ -14,7 +15,16 @@ const unsigned int SCREEN_HEIGHT = 600;
 
 // key settings
 bool spacePressed = false;
-bool showLighting = false;
+bool showColour = false;
+
+// mouse state
+double mouseX = 0.0, mouseY = 0.0;
+double prevMouseX = 0.0, prevMouseY = 0.0;
+float mouseVelX = 0.0, mouseVelY = 0.0;
+bool mousePressed = false;
+
+// pressure settings
+const int PRESSURE_ITERATIONS = 20;
 
 
 int main() {
@@ -50,8 +60,45 @@ int main() {
     }
 
 
+    // ---- GET FRAMEBUFFER SIZE (important for Retina/HiDPI displays) ------
+    int fbWidth, fbHeight;
+    glfwGetFramebufferSize(window, &fbWidth, &fbHeight);
+    
+    // Calculate scale factor between window and framebuffer
+    float pixelRatio = (float)fbWidth / SCREEN_WIDTH;
+
+
     // ---- SHADERS --------------------------------------
-    Shader raytraceShader("shaders/default.vert", "shaders/default.frag");
+    Shader forcefieldShader("shaders/default.vert", "shaders/fluidsim/forcefield.frag");
+    Shader advectionShader("shaders/default.vert", "shaders/fluidsim/advection.frag");
+    Shader pressureShader("shaders/default.vert", "shaders/fluidsim/pressure.frag");
+    Shader projectPressureShader("shaders/default.vert", "shaders/fluidsim/projectPressure.frag");
+    Shader fluidVisShader("shaders/default.vert", "shaders/fluidsim/fluidVis.frag");
+
+
+    // ---- PING-PONG FRAMEBUFFERS --------------------------------------
+    // Fluid textures: xy = velocity, z = dye, w = hue (RGBA32F)
+    unsigned int fluidTex[2];
+    unsigned int fluidFBO[2];
+    for (int i = 0; i < 2; i++) {
+        fluidTex[i] = createTexture(fbWidth, fbHeight, GL_RGBA32F, GL_RGBA, GL_FLOAT);
+        fluidFBO[i] = createFBO(fluidTex[i]);
+    }
+
+    // Pressure textures: single channel (R32F)
+    unsigned int pressureTex[2];
+    unsigned int pressureFBO[2];
+    for (int i = 0; i < 2; i++) {
+        pressureTex[i] = createTexture(fbWidth, fbHeight, GL_R32F, GL_RED, GL_FLOAT);
+        pressureFBO[i] = createFBO(pressureTex[i]);
+    }
+
+    // Ping-pong indices
+    int readIdx = 0;
+    int writeIdx = 1;
+    int pReadIdx = 0;
+    int pWriteIdx = 1;
+
 
     // ---- SETUP VERTEX DATA --------------------------------------
     float vertices[] = {
@@ -74,29 +121,126 @@ int main() {
 
 
     // ---- RENDER LOOP --------------------------------------
+    float prevTime = 0.0f;
+    float DT = 1.0f / 60.0f;  // initial value, updated each frame
+
     while (!glfwWindowShouldClose(window)) {
+
+        // Calculate delta time
+        float currentTime = (float)glfwGetTime();
+        float deltaTime = currentTime - prevTime;
+        prevTime = currentTime;
+        DT = std::min(deltaTime, 1.0f / 30.0f);     // Clamp DT to prevent instability (e.g., when window is minimized)
 
         // input
         processInput(window);
 
-        // render
-        glClearColor(0.2f, 0.3f, 0.3f, 1.0f);
-        glClear(GL_COLOR_BUFFER_BIT);
-
-        raytraceShader.use();
-
-        // draw triangles
         glBindVertexArray(VAO);
-        glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
+        glViewport(0, 0, fbWidth, fbHeight);
+
+
+        // ---- FORCEFIELD --------------------------------------
+        // (add forces from mouse input)
+        glActiveTexture(GL_TEXTURE0);
+        glBindTexture(GL_TEXTURE_2D, fluidTex[readIdx]);
+        glBindFramebuffer(GL_FRAMEBUFFER, fluidFBO[writeIdx]);
+
+        forcefieldShader.use();
+        forcefieldShader.setInt("uFluid", 0);
+        forcefieldShader.setVec3("iResolution", fbWidth, fbHeight, 1.0f);
+        forcefieldShader.setFloat("iTime", currentTime);
+        forcefieldShader.setVec2("iMouse", mouseX * pixelRatio, mouseY * pixelRatio);
+        forcefieldShader.setVec2("iMouseVel", mouseVelX * pixelRatio, mouseVelY * pixelRatio);
+        forcefieldShader.setFloat("DT", DT);
+        forcefieldShader.setFloat("InputRadius", 0.02f);
+        forcefieldShader.setFloat("InputStrength", 1000.0f);
+        forcefieldShader.setFloat("DyeStrength", 20.0f);
+        forcefieldShader.setFloat("VelocityDecay", 0.001);
+        forcefieldShader.setFloat("DyeDecay", 0.001);
         
+        glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
+        std::swap(readIdx, writeIdx);
+
+
+        // ---- ADVECTION --------------------------------------
+        // (move quantities along velocity field)
+        glActiveTexture(GL_TEXTURE0);
+        glBindTexture(GL_TEXTURE_2D, fluidTex[readIdx]);
+        glBindFramebuffer(GL_FRAMEBUFFER, fluidFBO[writeIdx]);
+
+        advectionShader.use();
+        advectionShader.setInt("uFluid", 0);
+        advectionShader.setVec3("iResolution", fbWidth, fbHeight, 1.0f);
+        advectionShader.setFloat("DT", DT);
+        
+        glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
+        std::swap(readIdx, writeIdx);
+
+
+        // ---- PRESSURE SOLVE --------------------------------------
+        // (Jacobi iterations)
+        // uFluid stays bound to velocity texture throughout pressure iterations
+        glActiveTexture(GL_TEXTURE0);
+        glBindTexture(GL_TEXTURE_2D, fluidTex[readIdx]);
+        
+        for (int i = 0; i < PRESSURE_ITERATIONS; i++) {
+            glActiveTexture(GL_TEXTURE1);
+            glBindTexture(GL_TEXTURE_2D, pressureTex[pReadIdx]);
+            glBindFramebuffer(GL_FRAMEBUFFER, pressureFBO[pWriteIdx]);
+
+            pressureShader.use();
+            pressureShader.setInt("uFluid", 0);
+            pressureShader.setInt("pFluid", 1);
+            pressureShader.setVec3("iResolution", fbWidth, fbHeight, 1.0f);
+            pressureShader.setFloat("DT", DT);
+            
+            glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
+            std::swap(pReadIdx, pWriteIdx);
+        }
+
+
+        // ---- PROJECT PRESSURE --------------------------------------
+        // (subtract pressure gradient)
+        glActiveTexture(GL_TEXTURE1);
+        glBindTexture(GL_TEXTURE_2D, pressureTex[pReadIdx]);
+        
+        glBindFramebuffer(GL_FRAMEBUFFER, fluidFBO[writeIdx]);
+        projectPressureShader.use();
+        projectPressureShader.setInt("uFluid", 0);
+        projectPressureShader.setInt("pFluid", 1);
+        projectPressureShader.setVec3("iResolution", fbWidth, fbHeight, 1.0f);
+        projectPressureShader.setFloat("DT", DT);
+        
+        glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
+        std::swap(readIdx, writeIdx);
+
+        
+        // ---- VISUALIZATION --------------------------------------
+        glActiveTexture(GL_TEXTURE0);
+        glBindTexture(GL_TEXTURE_2D, fluidTex[readIdx]);
+        
+        glBindFramebuffer(GL_FRAMEBUFFER, 0);       // render to default framebuffer (screen)
+        fluidVisShader.use();
+        fluidVisShader.setInt("uFluid", 0);
+        fluidVisShader.setVec3("iResolution", fbWidth, fbHeight, 1.0f);
+        fluidVisShader.setInt("ColourType", showColour ? 1 : 0);
+
+        glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
+
         glfwSwapBuffers(window);                    // swap buffers (double buffer - separate output and rendering buffer to reduce artifacts)
         glfwPollEvents();                           // checks for keyboard input, mouse movement... etc.
     }
     
-
     // deallocate resources
     glDeleteVertexArrays(1, &VAO);
     glDeleteBuffers(1, &VBO);
+
+    for (int i = 0; i < 2; i++) {
+        glDeleteFramebuffers(1, &fluidFBO[i]);
+        glDeleteTextures(1, &fluidTex[i]);
+        glDeleteFramebuffers(1, &pressureFBO[i]);
+        glDeleteTextures(1, &pressureTex[i]);
+    }
 
     // terminate window
     glfwTerminate();
@@ -114,4 +258,23 @@ void framebuffer_size_callback([[maybe_unused]] GLFWwindow* window, int width, i
 void processInput(GLFWwindow *window) {
     // close the window if user presses "ESC" key
     if (glfwGetKey(window, GLFW_KEY_ESCAPE) == GLFW_PRESS) glfwSetWindowShouldClose(window, true);
+
+    // mouse input
+    prevMouseX = mouseX;
+    prevMouseY = mouseY;
+    glfwGetCursorPos(window, &mouseX, &mouseY);
+    mouseY = SCREEN_HEIGHT - mouseY;  // flip Y to match OpenGL coords
+    
+    mousePressed = (glfwGetMouseButton(window, GLFW_MOUSE_BUTTON_LEFT) == GLFW_PRESS);
+    mouseVelX = mousePressed ? (float)(mouseX - prevMouseX) : 0.0f;
+    mouseVelY = mousePressed ? (float)(mouseY - prevMouseY) : 0.0f;
+
+    // toggle lighting when SPACE is pressed
+    if (glfwGetKey(window, GLFW_KEY_SPACE) == GLFW_PRESS && !spacePressed) {
+        spacePressed = true;
+        showColour = !showColour;
+    }
+    
+    // reset flag when key is released
+    if (glfwGetKey(window, GLFW_KEY_SPACE) == GLFW_RELEASE && spacePressed) spacePressed = false;
 }
