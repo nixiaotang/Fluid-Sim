@@ -1,0 +1,20 @@
+# Build artifacts
+/build/
+*.o
+*.d
+
+# root executable
+app
+
+# macOS system files
+.DS_Store
+
+# Editor/IDE settings (optional, if using VSCode)
+.vscode/
+
+# Logs
+*.log
+
+# Temporary files
+*~
+*.swp
